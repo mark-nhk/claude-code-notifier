@@ -40,8 +40,10 @@ function waitFor(predicate, { timeout = 5000, step = 25 } = {}) {
     });
 }
 
+const { COMPANION_ID, COMMAND_SHOW, COMMAND_READY } = require('../lib/companion');
+
 describe('extension end to end', () => {
-    let home, tmp, vscode, extension;
+    let home, tmp, vscode, extension, companionCalls;
 
     function notifyFile() {
         return path.join(tmp, 'claude-notify');
@@ -60,7 +62,18 @@ describe('extension end to end', () => {
         });
     }
 
-    function activate({ config = {} } = {}) {
+    // Stands in for VS Code's own persistent storage, which really does outlive a
+    // window — so a test can reuse one across two activations.
+    function makeStore() {
+        const values = new Map();
+        return {
+            values,
+            get: (key, fallback) => (values.has(key) ? values.get(key) : fallback),
+            update: (key, value) => { values.set(key, value); return Promise.resolve(); },
+        };
+    }
+
+    function activate({ config = {}, remoteName, companion = false, store, folders } = {}) {
         // Guard against a redirect that silently failed and would write to real paths.
         expect(require('os').homedir()).toBe(home);
         expect(require('os').tmpdir()).toBe(tmp);
@@ -68,10 +81,27 @@ describe('extension end to end', () => {
         jest.resetModules();
         vscode = require('vscode');
         vscode.__reset(config);
+        if (remoteName) vscode.__setRemoteName(remoteName);
+        if (folders) vscode.__setWorkspaceFolders(folders);
+        companionCalls = [];
+        if (companion) {
+            // Stand in for the companion extension on the user's own machine: present
+            // in the extension list, and answering the commands it registers.
+            vscode.__installExtension(COMPANION_ID);
+            vscode.commands.registerCommand(COMMAND_SHOW, (payload) => {
+                companionCalls.push(payload);
+                return { method: 'terminal-notifier', error: null };
+            });
+            vscode.commands.registerCommand(COMMAND_READY, () => true);
+        }
         // resetModules hands the extension a fresh mock, so re-capture it here.
         execFile = require('child_process').execFile;
         extension = require('../extension.js');
-        extension.activate({ extensionPath: REPO_ROOT, subscriptions: [] });
+        extension.activate({
+            extensionPath: REPO_ROOT,
+            subscriptions: [],
+            globalState: store || vscode.__globalState(),
+        });
     }
 
     beforeEach(() => {
@@ -205,10 +235,11 @@ describe('extension end to end', () => {
         fireHook({ notification_type: 'elicitation_dialog', message: 'Third request' });
         await waitFor(() => vscode.__state.warnings.length === 3);
 
+        // The hook runs in this repo, so every notification is stamped with its name.
         expect(vscode.__state.warnings.map(w => w.text)).toEqual([
-            '🔔 Claude Code: First request',
-            '🔔 Claude Code: Second request',
-            '🔔 Claude Code: Third request',
+            '🔔 Claude Code · claude-code-notifier: First request',
+            '🔔 Claude Code · claude-code-notifier: Second request',
+            '🔔 Claude Code · claude-code-notifier: Third request',
         ]);
     });
 
@@ -218,8 +249,12 @@ describe('extension end to end', () => {
         fireHook({ notification_type: 'permission_prompt', message: 'Before deletion' });
         await waitFor(() => vscode.__state.warnings.length === 1);
 
+        // Taking a notification moves the file aside, so wait for the watcher to put
+        // it back before deleting it — otherwise there is nothing to delete.
+        await waitFor(() => fs.existsSync(notifyFile()), { timeout: 4000 });
+
         // macOS prunes the temp directory; the old watcher died silently here.
-        fs.rmSync(notifyFile());
+        fs.rmSync(notifyFile(), { force: true });
         await waitFor(() => fs.existsSync(notifyFile()), { timeout: 4000 });
 
         fireHook({ notification_type: 'permission_prompt', message: 'After deletion' });
@@ -236,6 +271,147 @@ describe('extension end to end', () => {
         expect(vscode.__lastWarning().text).toContain('Test: Claude needs your permission');
     });
 
+    test('a task that finished too quickly is not announced', async () => {
+        activate({ config: { 'taskComplete.level': 'sound+banner', minTaskSeconds: 30 } });
+
+        // The real hook starts the clock, then reports the finish a moment later.
+        fireHook({ hook_event_name: 'UserPromptSubmit', session_id: 'quick' });
+        fireHook({ hook_event_name: 'Stop', session_id: 'quick', last_assistant_message: 'Done.' });
+
+        await new Promise(resolve => setTimeout(resolve, 300));
+        expect(vscode.__state.warnings).toHaveLength(0);
+    });
+
+    test('the clock hook never notifies on its own', async () => {
+        activate({ config: { 'taskComplete.level': 'sound+banner' } });
+        fireHook({ hook_event_name: 'UserPromptSubmit', session_id: 'silent' });
+
+        await new Promise(resolve => setTimeout(resolve, 300));
+        expect(vscode.__state.warnings).toHaveLength(0);
+    });
+
+    test('an existing install keeps behaving exactly as before', async () => {
+        // Someone who turned task-complete on and sound off in the old settings.
+        activate({ config: { notifyOnTaskComplete: true, sound: false } });
+        fireHook({ hook_event_name: 'Stop', last_assistant_message: 'Done.' });
+
+        await waitFor(() => vscode.__state.warnings.length > 0);
+        expect(execFile).toHaveBeenCalled();
+        // A banner, but nothing played — which is what those two settings meant.
+        const commands = execFile.mock.calls.map(c => c[0]);
+        expect(commands).not.toContain('afplay');
+    });
+
+    // ── which window answers ────────────────────────────────────────────────
+
+    // pid 1 is always running and is never this process, which makes it a reliable
+    // stand-in for another VS Code window that is still open.
+    function otherWindowHasOpen(folder) {
+        const dir = path.join(tmp, 'claude-notifier-windows');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, '1'), folder, 'utf8');
+    }
+
+    test('a notification is left alone when another window has that project open', async () => {
+        otherWindowHasOpen('/work/api');
+        activate({ folders: ['/work/web'] });
+
+        fireHook({ notification_type: 'permission_prompt', message: 'Need permission', cwd: '/work/api/src' });
+
+        await new Promise(resolve => setTimeout(resolve, 400));
+        expect(vscode.__state.warnings).toHaveLength(0);
+        // Still waiting, so the window it belongs to can pick it up.
+        expect(fs.readFileSync(notifyFile(), 'utf8')).toContain('Need permission');
+    });
+
+    test('the window that has the project open answers it', async () => {
+        otherWindowHasOpen('/work/api');
+        activate({ folders: ['/work/web'] });
+
+        fireHook({ notification_type: 'permission_prompt', message: 'Need permission', cwd: '/work/web/app' });
+
+        await waitFor(() => vscode.__state.warnings.length > 0);
+        expect(vscode.__lastWarning().text).toContain('Need permission');
+    });
+
+    test('a project no window has open is still announced', async () => {
+        otherWindowHasOpen('/work/api');
+        activate({ folders: ['/work/web'] });
+
+        fireHook({ notification_type: 'permission_prompt', message: 'Need permission', cwd: '/tmp/scratch' });
+
+        await waitFor(() => vscode.__state.warnings.length > 0);
+        expect(vscode.__lastWarning().text).toContain('Need permission');
+    });
+
+    test('a window announces the folders it has open, and takes the note back on close', () => {
+        activate({ folders: ['/work/web'] });
+        const marker = path.join(tmp, 'claude-notifier-windows', String(process.pid));
+        expect(fs.readFileSync(marker, 'utf8')).toBe('/work/web');
+
+        extension.deactivate();
+        expect(fs.existsSync(marker)).toBe(false);
+    });
+
+    // ── remote windows ──────────────────────────────────────────────────────
+
+    test('a remote window with no companion is offered one', async () => {
+        activate({ remoteName: 'ssh-remote+build-box' });
+
+        await waitFor(() => vscode.__state.infos.some(i => i.text.includes('Install the companion')));
+
+        const offer = vscode.__state.infos.find(i => i.text.includes('Install the companion'));
+        expect(offer.text).toContain('a remote machine over SSH');
+        expect(offer.items).toContain('Install companion');
+    });
+
+    test('the offer installs the companion when accepted', async () => {
+        activate({ remoteName: 'ssh-remote+build-box' });
+        const installed = [];
+        vscode.commands.registerCommand('workbench.extensions.installExtension', (id) => installed.push(id));
+
+        await waitFor(() => vscode.__state.infos.length > 0);
+        vscode.__answerLastInfo('Install companion');
+
+        await waitFor(() => installed.length > 0);
+        expect(installed).toEqual([COMPANION_ID]);
+    });
+
+    test('declining for good stops the offer coming back', async () => {
+        const store = makeStore();
+        activate({ remoteName: 'ssh-remote+build-box', store });
+        await waitFor(() => vscode.__state.infos.length > 0);
+        vscode.__answerLastInfo("Don't ask again");
+        await waitFor(() => store.values.size > 0);
+
+        activate({ remoteName: 'ssh-remote+build-box', store });
+        await new Promise(resolve => setTimeout(resolve, 200));
+        expect(vscode.__state.infos).toHaveLength(0);
+    });
+
+    test('a remote window with the companion delivers to the user instead', async () => {
+        activate({ remoteName: 'ssh-remote+build-box', companion: true });
+
+        await vscode.commands.executeCommand('claude-notifier.notify');
+        await waitFor(() => companionCalls.length > 0);
+
+        expect(companionCalls[0].text).toContain('Test: Claude needs your permission');
+        // Nothing was asked of the remote machine's own banner or sound.
+        expect(execFile).not.toHaveBeenCalled();
+        expect(vscode.__state.infos).toHaveLength(0);
+    });
+
+    test('a local window keeps the plain failure message and no offer', async () => {
+        activate();
+        execFile.mockImplementation((cmd, args, cb) => cb && cb(new Error('boom')));
+
+        await vscode.commands.executeCommand('claude-notifier.notify');
+        await waitFor(() => vscode.__state.warnings.some(w => w.text.includes('could not be shown')));
+
+        expect(vscode.__state.warnings.map(w => w.text).join('\n')).not.toContain('remote machine');
+        expect(vscode.__state.infos).toHaveLength(0);
+    });
+
     test('the diagnose command writes a report to an output channel', async () => {
         activate();
         await vscode.commands.executeCommand('claude-notifier.diagnose');
@@ -246,5 +422,28 @@ describe('extension end to end', () => {
         expect(text).toContain('Claude Code Notifier — diagnostics');
         expect(text).toContain('Hook configuration');
         expect(text).toContain('Trigger file');
+    }, 15000);
+
+    test('the report on a remote window with no companion names the fix', async () => {
+        activate({ remoteName: 'ssh-remote+build-box' });
+        await vscode.commands.executeCommand('claude-notifier.diagnose');
+
+        const text = vscode.__state.outputChannels[0].lines.join('\n');
+        expect(text).toContain('INFO  Where this runs');
+        expect(text).toContain('FAIL  Companion on your computer');
+        expect(text).toContain('Claude Code Notifier (Local)');
+    }, 15000);
+
+    test('the report on a remote window with the companion tests the real path', async () => {
+        activate({ remoteName: 'ssh-remote+build-box', companion: true });
+        await vscode.commands.executeCommand('claude-notifier.diagnose');
+
+        const text = vscode.__state.outputChannels[0].lines.join('\n');
+        expect(text).toContain('OK    Companion on your computer');
+        expect(text).toContain('Banner on your computer');
+        expect(text).toContain('Sound on your computer');
+        // The remote machine's own banner was never tested; it is not the one that matters.
+        expect(text).not.toContain('osascript');
+        expect(text).toContain('companion extension on your own computer delivered');
     }, 15000);
 });

@@ -165,6 +165,35 @@ describe('buildSettings', () => {
     });
 });
 
+describe('the task clock', () => {
+    const SCRIPT = '/home/user/.claude/notify.js';
+
+    test('is left out unless the user asked to skip short tasks', () => {
+        const { settings } = buildSettings({}, SCRIPT);
+        expect(settings.hooks.UserPromptSubmit).toBeUndefined();
+        expect(Object.keys(settings.hooks).sort()).toEqual(['Notification', 'Stop', 'SubagentStop']);
+    });
+
+    test('is registered once they do', () => {
+        const { settings, installed } = buildSettings({}, SCRIPT, { taskClock: true });
+        expect(installed).toBe(true);
+        expect(settings.hooks.UserPromptSubmit).toHaveLength(1);
+    });
+
+    test('is taken back out when they change their mind, leaving no empty section', () => {
+        const { settings: withClock } = buildSettings({}, SCRIPT, { taskClock: true });
+        const { settings, installed } = buildSettings(withClock, SCRIPT, { taskClock: false });
+        expect(installed).toBe(true);
+        expect('UserPromptSubmit' in settings.hooks).toBe(false);
+    });
+
+    test("someone else's UserPromptSubmit hook is never touched", () => {
+        const theirs = { hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'their-tool' }] }] } };
+        const { settings } = buildSettings(theirs, SCRIPT);
+        expect(settings.hooks.UserPromptSubmit).toEqual(theirs.hooks.UserPromptSubmit);
+    });
+});
+
 describe('removeManaged', () => {
     const scriptPath = '/home/user/.claude/notify.js';
 

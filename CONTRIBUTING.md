@@ -16,7 +16,7 @@ Extension watches the file (fs.watch + an independent poll)
        │  reads and clears the file immediately
        │  filters by the user's notification settings
        ▼
-VS Code popup + system banner + sound
+VS Code popup (unless the choice drops it) + system banner + sound
 ```
 
 **Key files:**
@@ -30,18 +30,67 @@ VS Code popup + system banner + sound
 | `lib/host-app.js` | Works out which editor the extension host runs inside |
 | `lib/hook-installer.js` | Installs and repairs `notify.js` and the hook config |
 | `lib/diagnostics.js` | Backs the *Diagnose Notifications* command |
+| `lib/remote-host.js` | Explains a remote window and what the user is told there |
+| `lib/companion.js` | Hands delivery to the companion on the user's own machine |
+| `companion/extension.js` | The companion extension — the pair of hands on that machine |
+| `scripts/sync-shared.js` | Copies the shared notification code into the companion package |
+| `lib/window-ownership.js` | Which window should answer a given notification |
+| `lib/window-markers.js` | Per-window notes saying which projects each has open |
+| `lib/settings.js` | What each event should do, including the older settings it replaced |
+| `lib/sounds.js` | Named sounds mapped to what each operating system ships |
 | `lib/payload.js` | Pure functions: parse trigger file, match event names |
 | `hooks/notify.js` | Claude Code hook script — reads stdin, writes trigger file |
 
 ### Two behaviours worth knowing
 
+**One choice per event, and the old settings still decide for anyone who set them.**
+`lib/settings.js` prefers a level the user explicitly chose; failing that, it translates
+whatever they had set among the four on/off switches and the two global toggles. The
+translation is lossless, which is why `editor-only` exists — turning both global toggles
+off used to leave the VS Code notification on its own, and that had to keep working. The
+old keys stay in the manifest marked as replaced, so nothing breaks and nothing is
+silently rewritten in anyone's settings file.
+
 **Popups are fire-and-forget.** The extension never waits for the user to click a
 popup before handling the next event. An earlier version did, which meant an
 unacknowledged popup silenced every later notification until VS Code was restarted.
 
-**The trigger file is cleared as soon as it is read.** With several VS Code windows
-open, whichever window reads first wins, so a single event produces one popup rather
-than one per window.
+**The notification goes to the window that has the work open.** Every window watches
+the same trigger file, so it used to be answered by whichever one read it first — a call
+from one project surfacing in another project's window, and `suppressWhenFocused`
+deciding on the wrong window's focus. Now the payload carries the directory Claude was
+working in, each window writes a note (named by process id, under the temp directory)
+listing the folders it has open, and a window answers only when it holds that directory.
+A window that does not hold it stands aside — unless no live window holds it, in which
+case somebody has to speak up. Notes from windows that are gone are ignored by process
+liveness and cleaned on the next activation.
+
+The folder-matching rules come from [ashmitb95/claude-notifier](https://github.com/ashmitb95/claude-notifier)
+(MIT), which had already found the two that bite: a session usually runs in a
+subdirectory rather than at the folder root, and Windows paths differ in case. Their
+hook does the fallback notifying itself; ours stays a single file and settles the
+unowned case in the extension instead.
+
+**A notification is claimed, not cleared.** Taking one renames the trigger file aside,
+which is atomic — when several windows reach for the same notification exactly one
+succeeds and the rest are told there is nothing there. It also means an unacknowledged
+notification can never replay, and the next write always reads as a change.
+
+**In a remote window, delivery is handed to a second extension.** VS Code runs an
+extension either on the user's machine or on the remote one — never both — so a banner
+asked for from a remote window reaches nobody. The companion extension declares itself
+local-only, registers two commands, and the main extension calls them; VS Code routes a
+command to whichever side registered it. If the companion is absent the call is rejected,
+which is exactly how its absence is detected, and delivery falls back to trying this
+machine. Because that fallback reaches nobody, a remote window without the companion also
+shows the VS Code notification for the choice that drops it. The main extension deliberately
+does *not* declare the companion as a hard dependency: local users never need it, and a
+failed install must not stop notifications.
+
+**Diagnostics test the path notifications really take.** With a companion in play, the
+report fires its banner and sound through the companion, because testing the remote
+machine's own banner would report a failure for something that works. The companion is
+re-checked when the command runs, not trusted from activation.
 
 **Banners are posted under the editor's own identity.** The bundle identifier is read
 from the running application at activation, so VS Code, Insiders, VSCodium and Cursor
@@ -58,8 +107,22 @@ Claude Code sends a JSON object to hook stdin. `notify.js` extracts:
 Output written to `$TMPDIR/claude-notify`:
 
 ```json
-{"event": "permission_prompt", "text": "Allow Bash command?"}
+{"event": "Stop", "text": "Claude finished...", "project": "billing-api", "durationMs": 42000}
 ```
+
+`project` is the basename of the hook's working directory, so a notification names the
+project that actually called out rather than whichever window happens to display it —
+with several windows open, only one of them is right.
+
+`durationMs` exists because `UserPromptSubmit` can also be registered: it writes a timestamp
+to `$TMPDIR/claude-notifier-task-<session id>` and never notifies. `Stop` reads that file,
+reports the elapsed time and deletes it. Without a start event there is nothing to measure
+from, which is the whole reason a fourth hook exists.
+
+It is installed **only when `minTaskSeconds` is above zero**, and removed again when it goes
+back to zero — the hook spawns a process on every prompt, and nobody should pay that for a
+feature they have not switched on. The extension re-runs installation when that setting
+changes, so the hook appears and disappears with it.
 
 ## Hook Configuration
 
@@ -144,9 +207,15 @@ npm test
 
 **Package locally:**
 ```bash
-vsce package
+npm run package                 # the main extension
+npm run package:companion       # the companion, from companion/
 code --install-extension claude-code-notifier-*.vsix
 ```
+
+The companion shares `lib/system-notification.js`, `lib/host-app.js` and the icon rather
+than owning copies of them. `scripts/sync-shared.js` copies them in, and it runs
+automatically before the companion is packaged or published, so the copies are never
+committed.
 
 **Simulate a hook:**
 ```bash
@@ -158,8 +227,24 @@ echo '{"hook_event_name":"SubagentStop","last_assistant_message":"Subagent done"
 **Publish:**
 ```bash
 vsce login erdemgiray
-vsce publish        # uses current version in package.json
-vsce publish minor  # bumps minor version and publishes
+vsce publish                    # the main extension, version from package.json
+cd companion && vsce publish    # the companion, versioned independently
+```
+
+The two are versioned independently on purpose — the companion changes rarely, and
+bumping it for every main release would be noise. Anything that changes the commands
+they exchange has to ship on both sides.
+
+## Architecture diagram (remote window)
+
+```
+remote machine                                  the user's computer
+──────────────                                  ───────────────────
+Claude Code hook → trigger file
+       │
+Claude Code Notifier  ── VS Code command ──▶  Claude Code Notifier (Local)
+       │                                              │
+   VS Code popup ────────── drawn locally ───────▶ banner + sound
 ```
 
 ## Test Coverage
@@ -177,6 +262,12 @@ Everything except "did a banner physically appear on screen" is covered by
 | `test/host-app.test.js` | Resolving the host editor's bundle identifier |
 | `test/hook-installer.test.js` | Settings write, idempotency, repair of legacy installs |
 | `test/diagnostics.test.js` | Setup checks, live checks, and report wording |
+| `test/remote-host.test.js` | Recognising a remote window and what the user is told |
+| `test/companion.test.js` | Routing to the companion, detecting it, diagnosing through it |
+| `test/window-ownership.test.js` | Folder matching and which window answers |
+| `test/window-markers.test.js` | Writing, reading and tidying the per-window notes |
+| `test/settings.test.js` | Per-event levels and the translation of the old settings |
+| `test/sounds.test.js` | Named sounds resolving per platform |
 | `test/payload.test.js` | Trigger file parsing and event-name matching |
 | `test/notify.test.js` | `hooks/notify.js` stdin parsing and file write |
 

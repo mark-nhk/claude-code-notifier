@@ -13,6 +13,11 @@ const state = {
     outputChannels: [],
     config: {},
     focused: false,
+    remoteName: undefined,
+    extensions: new Map(),
+    globalState: new Map(),
+    configListeners: [],
+    workspaceFolders: undefined,
 };
 
 function reset(config = {}) {
@@ -23,6 +28,11 @@ function reset(config = {}) {
     state.outputChannels = [];
     state.config = { ...config };
     state.focused = false;
+    state.remoteName = undefined;
+    state.extensions = new Map();
+    state.globalState = new Map();
+    state.configListeners = [];
+    state.workspaceFolders = undefined;
 }
 
 function recordMessage(bucket, text, items) {
@@ -54,8 +64,19 @@ const vscode = {
         },
     },
     workspace: {
+        onDidChangeWorkspaceFolders: () => ({ dispose: () => {} }),
+        get workspaceFolders() {
+            return state.workspaceFolders;
+        },
+        onDidChangeConfiguration: (handler) => {
+            state.configListeners.push(handler);
+            return { dispose: () => {} };
+        },
         getConfiguration: () => ({
             get: (key, fallback) => (key in state.config ? state.config[key] : fallback),
+            // A test config models settings the user actually chose, which is exactly
+            // what inspect() reports as explicitly set.
+            inspect: (key) => (key in state.config ? { globalValue: state.config[key] } : {}),
         }),
     },
     commands: {
@@ -63,13 +84,24 @@ const vscode = {
             state.commands.set(id, handler);
             return { dispose: () => state.commands.delete(id) };
         },
+        // Real VS Code rejects an unknown command, which is exactly how the absence of
+        // the companion extension is detected — so the stand-in must reject too.
         executeCommand: (id, ...args) => {
             const handler = state.commands.get(id);
-            return handler ? handler(...args) : undefined;
+            if (!handler) return Promise.reject(new Error(`command '${id}' not found`));
+            return Promise.resolve(handler(...args));
         },
     },
+    extensions: {
+        getExtension: (id) => state.extensions.get(id),
+    },
     Uri: { parse: (value) => ({ value }) },
-    env: { openExternal: () => Promise.resolve(true) },
+    env: {
+        openExternal: () => Promise.resolve(true),
+        get remoteName() {
+            return state.remoteName;
+        },
+    },
 
     // test helpers
     __state: state,
@@ -79,8 +111,27 @@ const vscode = {
         const last = state.warnings[state.warnings.length - 1];
         if (last) last.resolve(selection);
     },
-    __setConfig: (config) => { state.config = { ...state.config, ...config }; },
+    __setConfig: (config) => {
+        state.config = { ...state.config, ...config };
+        const changed = Object.keys(config);
+        const event = { affectsConfiguration: (key) => changed.some(k => `claudeCodeNotifier.${k}` === key) };
+        state.configListeners.forEach(handler => handler(event));
+    },
     __setFocused: (value) => { state.focused = value; },
+    __setRemoteName: (value) => { state.remoteName = value; },
+    __setWorkspaceFolders: (paths) => {
+        state.workspaceFolders = paths && paths.map(p => ({ uri: { fsPath: p } }));
+    },
+    __installExtension: (id) => { state.extensions.set(id, { id, isActive: true }); },
+    __globalState: () => ({
+        get: (key, fallback) => (state.globalState.has(key) ? state.globalState.get(key) : fallback),
+        update: (key, value) => { state.globalState.set(key, value); return Promise.resolve(); },
+    }),
+    __lastInfo: () => state.infos[state.infos.length - 1],
+    __answerLastInfo: (selection) => {
+        const last = state.infos[state.infos.length - 1];
+        if (last) last.resolve(selection);
+    },
 };
 
 module.exports = vscode;
